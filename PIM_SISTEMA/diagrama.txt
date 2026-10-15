@@ -1,0 +1,62 @@
+DIAGRAMA — SEGURANÇA / PERMISSÕES / TI
+
+FUNCIONARIO
+  PK id_funcionario
+  nome
+  cpf
+  setor
+  status            (ATIVO, DESLIGADO)
+  data_admissao
+  data_desligamento
+       │
+       │ 1:1
+       ▼
+USUARIO
+  PK id_usuario
+  FK id_funcionario
+  login
+  senha_hash
+  status            (ATIVO, BLOQUEADO, REVOGADO)
+  ultimo_acesso
+       │
+       ├────────────── 1:N ──────────────> LOG_ACESSO
+       │                                     PK id_log
+       │                                     FK id_usuario
+       │                                     data_hora
+       │                                     tipo
+       │                                     descricao
+       │
+       │ N:N
+       ▼
+USUARIO_PERFIL
+  FK id_usuario
+  FK id_perfil
+       │
+       ▼
+PERFIL
+  PK id_perfil
+  nome
+  descricao
+       │
+       │ N:N
+       ▼
+PERFIL_PERMISSAO
+  FK id_perfil
+  FK id_permissao
+       │
+       ▼
+PERMISSAO
+  PK id_permissao
+  nome
+  descricao
+
+FUNCIONARIO
+       │
+       │ 1:N
+       ▼
+FERIAS
+  PK id_ferias
+  FK id_funcionario
+  data_inicio
+  data_fim
+  status            (AGENDADA, EM_ANDAMENTO, ENCERRADA, CANCELADA)
