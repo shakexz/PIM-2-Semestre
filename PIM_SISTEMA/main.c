@@ -123,16 +123,16 @@ int tem_permissao(const char *permissao) {
  * guarda tudo que acontece no sistema.
  * O tipo é o evento, como LOGIN_SUCESSO ou BLOQUEIO, e a descrição explica o que aconteceu
  */
-void registrar_log(const char *tipo, const char *descricao) {
+void registrar_log(const char *setor, const char *tipo, const char *descricao) {
     char idbuf[32];
     snprintf(idbuf, sizeof(idbuf), "%d", usuario_logado);
 
-    const char *params[3] = {idbuf, tipo, descricao};
+    const char *params[4] = {idbuf, setor, tipo, descricao};
     const char *sql =
-        "INSERT INTO log_acesso(id_usuario, tipo, descricao) "
-        "VALUES($1::integer, $2, $3)";
+        "INSERT INTO log_acesso(id_usuario, setor, tipo, descricao) "
+        "VALUES($1::integer, $2, $3, $4)";
 
-    PGresult *res = PQexecParams(conn, sql, 3, NULL, params, NULL, NULL, 0);
+    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         fprintf(stderr, "Aviso: falha ao registrar log: %s\n", PQerrorMessage(conn));
     }
@@ -207,8 +207,8 @@ int login(void) {
 
         const char *params_log[1] = {descricao};
         const char *logsql =
-            "INSERT INTO log_acesso(tipo, descricao) "
-            "VALUES('LOGIN_NEGADO', $1)";
+            "INSERT INTO log_acesso(setor, tipo, descricao) "
+            "VALUES('SEGURANCA', 'LOGIN_NEGADO', $1)";
 
         PGresult *logres = PQexecParams(conn, logsql, 1, NULL, params_log, NULL, NULL, 0);
         PQclear(logres);
@@ -228,7 +228,7 @@ int login(void) {
     PGresult *upd = PQexecParams(conn, update_sql, 1, NULL, params_update, NULL, NULL, 0);
     PQclear(upd);
 
-    registrar_log("LOGIN_SUCESSO", "Login realizado com sucesso");
+    registrar_log("SEGURANCA", "LOGIN_SUCESSO", "Login realizado com sucesso");
     return 1;
 }
 
@@ -259,9 +259,33 @@ void alterar_senha(void) {
     PGresult *res = PQexecParams(conn, sql, 3, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) == PGRES_COMMAND_OK && atoi(PQcmdTuples(res)) > 0) {
         printf("Senha alterada com sucesso.\n");
-        registrar_log("SENHA_ALTERADA", "Usuário alterou a própria senha");
+        registrar_log("SEGURANCA", "SENHA_ALTERADA", "Usuário alterou a própria senha");
     } else {
         printf("Não foi possível alterar. Confira a senha atual.\n");
+    }
+    PQclear(res);
+}
+
+/* Recuperação simples para este projeto: o administrador define uma nova senha. */
+void redefinir_senha_usuario(void) {
+    char login[100], nova[100], confirmacao[100];
+    ler_string("Login do usuário: ", login, sizeof(login));
+    ler_string("Nova senha (mínimo 4 caracteres): ", nova, sizeof(nova));
+    ler_string("Repita a nova senha: ", confirmacao, sizeof(confirmacao));
+    if (strlen(nova) < 4 || strcmp(nova, confirmacao) != 0) {
+        printf("Senha inválida ou as senhas não são iguais.\n");
+        return;
+    }
+    const char *params[2] = {nova, login};
+    const char *sql = "UPDATE usuario SET senha_hash=crypt($1, gen_salt('bf')) WHERE login=$2 AND status='ATIVO'";
+    PGresult *res = PQexecParams(conn, sql, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) == PGRES_COMMAND_OK && atoi(PQcmdTuples(res)) > 0) {
+        char descricao[180];
+        snprintf(descricao, sizeof(descricao), "Administrador redefiniu a senha do login %s", login);
+        registrar_log("SEGURANCA", "SENHA_REDEFINIDA", descricao);
+        printf("Senha redefinida. Avise o usuário por um canal combinado.\n");
+    } else {
+        printf("Usuário ativo não encontrado ou erro ao redefinir senha.\n");
     }
     PQclear(res);
 }
@@ -325,7 +349,7 @@ void revogar_usuario(void) {
         printf("Acesso revogado.\n");
         char descricao[100];
         snprintf(descricao, sizeof(descricao), "Administrador revogou o acesso do usuário ID %d", id);
-        registrar_log("REVOGACAO", descricao);
+        registrar_log("SEGURANCA", "REVOGACAO", descricao);
     } else if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         printf("Usuário não encontrado. Confira o ID.\n");
     } else {
@@ -361,7 +385,7 @@ void bloquear_usuario(void) {
         printf("Usuário bloqueado.\n");
         char descricao[100];
         snprintf(descricao, sizeof(descricao), "Administrador bloqueou o usuário ID %d", id);
-        registrar_log("BLOQUEIO", descricao);
+        registrar_log("SEGURANCA", "BLOQUEIO", descricao);
     } else if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         printf("Usuário não encontrado. Confira o ID.\n");
     } else {
@@ -396,7 +420,7 @@ void desbloquear_usuario(void) {
         printf("Usuário ativado.\n");
         char descricao[100];
         snprintf(descricao, sizeof(descricao), "Administrador ativou o usuário ID %d", id);
-        registrar_log("DESBLOQUEIO", descricao);
+        registrar_log("SEGURANCA", "DESBLOQUEIO", descricao);
     } else {
         printf("Não foi possível ativar. Verifique se o ID existe e se o funcionário está ativo.\n");
     }
@@ -468,7 +492,7 @@ void cadastrar_usuario(void) {
         char descricao[200];
         snprintf(descricao, sizeof(descricao), "Novo usuário cadastrado: %s (perfil %s)",
                  login_novo, perfil_nome);
-        registrar_log("CADASTRO_USUARIO", descricao);
+        registrar_log("SEGURANCA", "CADASTRO_USUARIO", descricao);
     } else {
         printf("Erro ao cadastrar (talvez o CPF ou o login já existam): %s\n",
                PQerrorMessage(conn));
@@ -506,7 +530,7 @@ void desligar_funcionario(void) {
         printf("Funcionário desligado.\n");
         char descricao[100];
         snprintf(descricao, sizeof(descricao), "Funcionário ID %d foi desligado", id);
-        registrar_log("DESLIGAMENTO", descricao);
+        registrar_log("RH", "DESLIGAMENTO", descricao);
     } else if (PQresultStatus(res) == PGRES_COMMAND_OK) {
         printf("Não foi possível desligar (ID não existe, já está desligado ou é o seu próprio).\n");
     } else {
@@ -553,7 +577,7 @@ void cadastrar_ferias(void) {
         char descricao[150];
         snprintf(descricao, sizeof(descricao), "Férias cadastradas para o funcionário ID %d (%s a %s)",
                  idfunc, inicio, fim);
-        registrar_log("FERIAS", descricao);
+        registrar_log("RH", "FERIAS", descricao);
     } else {
         printf("Erro (confira o ID do funcionário e as datas): %s\n", PQerrorMessage(conn));
     }
@@ -628,25 +652,39 @@ void minhas_permissoes(void) {
  * A ideia é manter um histórico do que aconteceu para auditoria.
  */
 void listar_logs(void) {
-    const char *sql =
-        "SELECT to_char(l.data_hora, 'YYYY-MM-DD HH24:MI:SS'), COALESCE(u.login,'-'), l.tipo, l.descricao "
-        "FROM log_acesso l LEFT JOIN usuario u ON u.id_usuario=l.id_usuario "
-        "ORDER BY l.data_hora DESC, l.id_log DESC LIMIT 100";
+    char inicio[16], fim[16], usuario[100], setor[51];
+    ler_string("Data inicial (AAAA-MM-DD): ", inicio, sizeof(inicio));
+    ler_string("Data final (AAAA-MM-DD): ", fim, sizeof(fim));
+    ler_string("Login (Enter para todos): ", usuario, sizeof(usuario));
+    ler_string("Setor (Enter para todos, ex.: RH, FINANCEIRO): ", setor, sizeof(setor));
 
-    PGresult *res = PQexec(conn, sql);
+    if (strlen(inicio) != 10 || strlen(fim) != 10) {
+        printf("Informe as datas no formato AAAA-MM-DD.\n");
+        return;
+    }
+    const char *params[4] = {inicio, fim, usuario, setor};
+    const char *sql =
+        "SELECT to_char(l.data_hora, 'YYYY-MM-DD HH24:MI:SS'), COALESCE(u.login,'-'), l.setor, l.tipo, COALESCE(l.descricao,'') "
+        "FROM log_acesso l LEFT JOIN usuario u ON u.id_usuario=l.id_usuario "
+        "WHERE l.data_hora >= $1::date AND l.data_hora < ($2::date + INTERVAL '1 day') "
+        "AND ($3 = '' OR u.login = $3) AND ($4 = '' OR l.setor = upper($4)) "
+        "ORDER BY l.data_hora DESC, l.id_log DESC LIMIT 500";
+
+    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         fprintf(stderr, "%s\n", PQerrorMessage(conn));
         PQclear(res);
         return;
     }
 
-    printf("\nDATA/HORA            LOGIN              TIPO              DESCRICAO\n");
-    printf("--------------------------------------------------------------------------------\n");
+    printf("\nDATA/HORA            LOGIN              SETOR           TIPO              DESCRICAO\n");
+    printf("------------------------------------------------------------------------------------------\n");
     for (int i = 0; i < PQntuples(res); i++) {
-        printf("%-20s %-18s %-17s %s\n",
+        printf("%-20s %-18s %-15s %-17s %s\n",
                PQgetvalue(res, i, 0), PQgetvalue(res, i, 1),
-               PQgetvalue(res, i, 2), PQgetvalue(res, i, 3));
+               PQgetvalue(res, i, 2), PQgetvalue(res, i, 3), PQgetvalue(res, i, 4));
     }
+    if (PQntuples(res) == 0) printf("Nenhum log encontrado no período informado.\n");
 
     PQclear(res);
 }
@@ -763,6 +801,7 @@ void menu_admin(void) {
         printf("8 - Consultar permissoes de todos os perfis\n");
         printf("9 - Consultar logs\n");
         printf("10 - Alterar minha senha\n");
+        printf("11 - Recuperar senha de usuário\n");
         printf("0 - Sair\n");
 
         if (!ler_inteiro("Escolha: ", &op)) {
@@ -847,6 +886,14 @@ void menu_admin(void) {
                 break;
             case 10:
                 alterar_senha();
+                pausa();
+                break;
+            case 11:
+                if (!tem_permissao("USUARIOS_GERENCIAR")) {
+                    printf("Acesso negado para recuperar senha.\n");
+                } else {
+                    redefinir_senha_usuario();
+                }
                 pausa();
                 break;
             case 0:

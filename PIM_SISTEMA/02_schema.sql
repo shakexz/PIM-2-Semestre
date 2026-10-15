@@ -80,13 +80,29 @@ CREATE TABLE IF NOT EXISTS log_acesso (
     id_log SERIAL PRIMARY KEY,
     id_usuario INTEGER REFERENCES usuario(id_usuario) ON DELETE SET NULL,
     data_hora TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    setor VARCHAR(50) NOT NULL DEFAULT 'SISTEMA',
     tipo VARCHAR(30) NOT NULL,
     descricao TEXT
 );
 
+-- Mantém o script compatível com bancos criados antes da classificação por setor.
+ALTER TABLE log_acesso ADD COLUMN IF NOT EXISTS setor VARCHAR(50) NOT NULL DEFAULT 'SISTEMA';
+
+-- Migra os valores se o banco já usava a coluna modulo.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'log_acesso' AND column_name = 'modulo'
+    ) THEN
+        EXECUTE 'UPDATE log_acesso SET setor = modulo WHERE setor = ''SISTEMA'' AND modulo IS NOT NULL';
+    END IF;
+END $$;
+
 -- Índices.
 -- (O login não precisa de índice extra porque o UNIQUE já cria um.)
 CREATE INDEX IF NOT EXISTS idx_log_usuario ON log_acesso(id_usuario);
+CREATE INDEX IF NOT EXISTS idx_log_data_setor ON log_acesso(data_hora, setor);
 CREATE INDEX IF NOT EXISTS idx_ferias_funcionario ON ferias(id_funcionario);
 
 -- --- PERFIS INICIAIS ---

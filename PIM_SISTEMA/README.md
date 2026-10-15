@@ -17,6 +17,8 @@ Projeto acadêmico em C integrado ao PostgreSQL usando libpq.
 - Consulta de permissões (as minhas e as de todos os perfis).
 - Alteração da própria senha.
 - Logs de acesso e eventos.
+- Consulta de logs por período obrigatório, com usuário e setor opcionais.
+- Redefinição de senha pelo administrador.
 
 ## Arquivos
 - `01_criar_banco.sql` — cria o banco `erp_torra`.
@@ -122,6 +124,7 @@ Quem tem a permissão `USUARIOS_GERENCIAR` (perfil ADMIN) entra no menu de Segur
 8. Consultar permissões de todos os perfis
 9. Consultar logs
 10. Alterar minha senha
+11. Recuperar senha de usuário
 
 Os demais usuários entram na área do usuário:
 
@@ -173,13 +176,13 @@ Entrar novamente como admin e consultar os logs para demonstrar:
 - férias;
 - troca de senha.
 
-## Integração com o ERP
+## Escopo atual
 
-O módulo de Segurança/TI funciona como uma camada comum para os demais módulos:
+Este projeto cobre Segurança/TI, usuários, permissões, férias e logs. Os módulos de Vendas, Estoque, Compras e Financeiro são apenas opções demonstrativas de acesso; ainda não estão implementados nem integrados aos projetos dos outros grupos.
 
-RH → situação do funcionário → Segurança → Login/Permissões
+Os logs ficam no PostgreSQL junto com as demais tabelas e possuem setor, tipo, data/hora, usuário e descrição. A consulta exige data inicial e final e aceita login e setor como filtros opcionais. Exemplos de setor: RH e FINANCEIRO.
 
-Vendas, Estoque, Compras, Financeiro e Relatórios podem consultar as permissões do mesmo usuário no PostgreSQL.
+A recuperação de senha é feita pelo administrador, que define uma nova senha para um usuário ativo. O sistema registra essa ação no log. Não há envio automático de senha, pois o projeto não possui cadastro de e-mail ou outro canal de contato.
 
 ## Observação
 
