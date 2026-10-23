@@ -81,13 +81,13 @@ set "CHK=%~1"
 set "CHK=%CHK:/=\%"
 if not exist "%CHK%\libpq-fe.h" exit /b 1
 echo Tentando compilar com: %~1
-"%GCC%" -Wall -Wextra -g3 main.c -o output\main.exe -I"%~1" -L"%~2" -lpq
+"%GCC%" -D__USE_MINGW_ANSI_STDIO=1 -Wall -Wextra -g3 main.c -o output\main.exe -I"%~1" -L"%~2" -lpq -I"C:/msys64/ucrt64/include" -L"C:/msys64/ucrt64/lib" -lmongoc2 -lbson2 -lws2_32
 if not errorlevel 1 goto tentar_ok
 echo   gcc terminou com o codigo %errorlevel%
 rem Segunda tentativa: liga direto no libpq.dll
 if not exist "%~3\libpq.dll" exit /b 1
 echo Tentando ligar direto no libpq.dll...
-"%GCC%" -Wall -Wextra -g3 main.c -o output\main.exe -I"%~1" "%~3\libpq.dll"
+"%GCC%" -D__USE_MINGW_ANSI_STDIO=1 -Wall -Wextra -g3 main.c -o output\main.exe -I"%~1" -I"C:/msys64/ucrt64/include" -L"C:/msys64/ucrt64/lib" "%~3\libpq.dll" -lmongoc2 -lbson2 -lws2_32
 if errorlevel 1 (
     echo   gcc terminou com o codigo %errorlevel%
     exit /b 1

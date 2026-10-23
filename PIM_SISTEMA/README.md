@@ -7,13 +7,11 @@ Projeto acadêmico em C integrado ao PostgreSQL usando libpq.
 - Login com senha armazenada como hash usando pgcrypto/bcrypt.
 - Verificação de usuário, senha, status da conta e status do funcionário.
 - Bloqueio de funcionário desligado.
-- Bloqueio durante qualquer período de férias vigente, salvo férias canceladas ou encerradas.
 - Perfis e permissões.
 - Cadastro de usuários (com validação de CPF, senha e perfil).
 - Bloqueio e revogação de acesso.
 - Reativação de usuário.
 - Desligamento de funcionário.
-- Cadastro de férias.
 - Consulta de permissões (as minhas e as de todos os perfis).
 - Alteração da própria senha.
 - Logs de acesso e eventos.
@@ -112,31 +110,20 @@ Para um projeto real, essa senha deve ser trocada. Use a opção **10 - Alterar 
 
 ## 6. Menus
 
-Quem tem a permissão `USUARIOS_GERENCIAR` (perfil ADMIN) entra no menu de Segurança/TI:
+Quem tem `USUARIOS_GERENCIAR` (perfil ADMIN) entra no menu de Seguranca/TI:
 
-1. Listar usuários
-2. Cadastrar usuário
-3. Bloquear usuário
+1. Listar usuarios
+2. Cadastrar usuario
+3. Bloquear usuario
 4. Revogar acesso
-5. Reativar usuário
-6. Desligar funcionário
-7. Cadastrar férias
-8. Consultar permissões de todos os perfis
-9. Consultar logs
-10. Alterar minha senha
-11. Recuperar senha de usuário
+5. Reativar usuario
+6. Desligar funcionario (permissao exclusiva do ADMIN)
+7. Consultar permissoes dos perfis
+8. Consultar logs
+9. Alterar minha senha
+10. Recuperar senha de usuario
 
-Os demais usuários entram na área do usuário:
-
-1. Consultar minhas permissões
-2. Acessar módulo de vendas
-3. Acessar módulo de estoque
-4. Acessar módulo de compras
-5. Acessar financeiro
-6. Cadastrar férias (só com a permissão `FERIAS_GERENCIAR`, perfil RH)
-7. Consultar logs (só com a permissão `LOGS_VISUALIZAR`, perfil GERENCIA)
-8. Alterar minha senha
-
+Os demais usuarios veem as opcoes de consulta de permissoes, vendas, estoque, compras, financeiro, relatorios/logs (GERENCIA) e alteracao da propria senha. O item 0 faz logoff, registra LOGOFF e retorna para a tela de login sem fechar o programa. O acesso as operacoes e controlado pelas permissoes do perfil.
 ## 7. Fluxo para demonstrar no PIM
 
 ### Teste 1 — Login
@@ -146,7 +133,7 @@ Os demais usuários entram na área do usuário:
 ### Teste 2 — Permissões
 1. Cadastrar um usuário com o perfil ESTOQUE (a opção 2 já cria o funcionário e o usuário).
 2. Sair e entrar com esse usuário.
-3. Na opção 1 (Consultar minhas permissões), mostrar que ele possui `ESTOQUE_VISUALIZAR` e `ESTOQUE_EDITAR`.
+3. Na opção 1 (Consultar minhas permissões), mostrar que ele possui `ESTOQUE_PRODUTOS_GERENCIAR` e `ESTOQUE_MINIMO_GERENCIAR`.
 4. Mostrar que o módulo de Vendas e o Financeiro são negados.
 
 ### Teste 3 — Revogação
@@ -155,17 +142,12 @@ Os demais usuários entram na área do usuário:
 3. Tentar entrar novamente com o usuário revogado.
 4. O sistema deve negar o acesso.
 
-### Teste 4 — Férias
-1. Cadastrar um período de férias que inclua a data atual (opção 7).
-2. Tentar acessar com o funcionário.
-3. O login deve ser recusado durante o período.
-
-### Teste 5 — Desligamento
+### Teste 4 — Desligamento
 1. Como admin, usar a opção 6 (Desligar funcionário) e informar o ID do funcionário
    (o ID aparece na listagem de usuários, coluna `ID FUNC`).
 2. Tentar entrar com esse usuário. Mesmo com a senha correta, ele não deverá entrar.
 
-### Teste 6 — Logs
+### Teste 5 — Logs
 Entrar novamente como admin e consultar os logs para demonstrar:
 - login realizado;
 - login negado (com o login que foi tentado);
@@ -173,17 +155,36 @@ Entrar novamente como admin e consultar os logs para demonstrar:
 - revogação;
 - cadastro de usuário;
 - desligamento;
-- férias;
 - troca de senha.
 
 ## Escopo atual
 
-Este projeto cobre Segurança/TI, usuários, permissões, férias e logs. Os módulos de Vendas, Estoque, Compras e Financeiro são apenas opções demonstrativas de acesso; ainda não estão implementados nem integrados aos projetos dos outros grupos.
-
-Os logs ficam no PostgreSQL junto com as demais tabelas e possuem setor, tipo, data/hora, usuário e descrição. A consulta exige data inicial e final e aceita login e setor como filtros opcionais. Exemplos de setor: RH e FINANCEIRO.
-
-A recuperação de senha é feita pelo administrador, que define uma nova senha para um usuário ativo. O sistema registra essa ação no log. Não há envio automático de senha, pois o projeto não possui cadastro de e-mail ou outro canal de contato.
+O projeto inclui telas operacionais para Vendas, Estoque, Compras, Financeiro, RH e Gestao/Relatorios, com autorizacao por permissao.
 
 ## Observação
 
 O projeto é uma base acadêmica funcional para demonstração do módulo de Segurança/Permissões/TI. Para produção seriam necessários controles adicionais, como gestão segura de segredos, recuperação de senha, sessões, proteção contra tentativas repetidas de login, TLS e política de auditoria.
+
+## Atualizacao do escopo e integracao entre grupos
+
+O fluxo de cadastro de ferias foi retirado. O perfil ADMIN e o unico que recebe `FUNCIONARIOS_DESLIGAR`. VENDAS recebe `VENDAS_CADASTRAR`; ESTOQUE recebe `ESTOQUE_PRODUTOS_GERENCIAR` e `ESTOQUE_MINIMO_GERENCIAR`; COMPRAS recebe `COMPRAS_ALERTAS_VISUALIZAR`; GERENCIA recebe `RELATORIOS_VISUALIZAR` e `LOGS_VISUALIZAR`. Essas permissoes podem ser aplicadas a bancos ja existentes ao executar novamente `02_schema.sql`.
+
+As telas operacionais usam tabelas PostgreSQL com prefixos por area: `estoque_produto`, `vendas_venda`, `compras_alerta_reposicao` e `compras_pedido`. Vendas baixa o saldo em uma operacao atomica; quando o saldo chega ao minimo, o sistema cria/atualiza um alerta aberto para Compras. O recebimento da compra atualiza o saldo e atende o alerta. Gestao tem relatorios mensais de vendas e compras, posicao de estoque e consulta de logs. As tabelas estao separadas por prefixo para facilitar a integracao futura com os demais grupos; alinhem com eles os campos e identificadores antes de consolidar o banco.
+
+Para criar as tabelas operacionais e reaplicar a matriz de acessos em uma instalacao existente, execute novamente `02_schema.sql` no banco PostgreSQL `erp_torra`. O script remove concessoes antigas apenas dos perfis padrao e recria as permissões previstas; perfis personalizados nao sao alterados. Os menus mostram somente os modulos e operacoes liberados, e cada tela valida a permissao novamente ao abrir.
+
+### Contrato de log para os grupos
+
+`log_acesso` foi preparada para compartilhar eventos entre sistemas: `id_evento` (UUID), `sistema_origem`, `data_hora`, `actor_login`, `setor`, `tipo` e `descricao`. `id_usuario` e uma referencia local opcional; os demais grupos nao devem depender desse ID, pois ele muda de um banco para outro. Cada grupo deve usar a mesma convencao de campos e nomes de evento, com `sistema_origem` identificando a aplicacao. O login do ator e copiado para o evento para que o historico continue legivel mesmo sem o cadastro local daquele usuario.
+
+### MongoDB no programa
+
+O aplicativo envia os eventos novos para `erp_auditoria.audit_events` e consulta essa colecao na tela de logs. A conexao usa a variavel de ambiente `MONGODB_URI`; nao grave a URI nem a senha no codigo ou no Git. No MSYS2 UCRT64, o driver C pode ser instalado com `pacman -S mingw-w64-ucrt-x86_64-mongo-c-driver`. O script `compilar_e_rodar (1).bat` inclui as bibliotecas do driver na compilacao.
+
+No Atlas, use um usuario de banco com permissao `readWrite` somente em `erp_auditoria`, configure a lista de IPs permitidos e obtenha a URI em Connect > Drivers > C. A aplicacao testa a conexao e cria um indice unico de `id_evento` ao iniciar. A colecao e criada pelo MongoDB no primeiro evento.
+
+Os logs novos sao gravados no MongoDB. O historico PostgreSQL anterior foi limpo depois da confirmacao da gravacao e consulta no MongoDB; a tabela `log_acesso` continua no schema como referencia de compatibilidade.
+
+Os grupos devem enviar documentos com `id_evento`, `sistema_origem`, `data_hora` (BSON Date), `actor_login`, `setor`, `tipo` e `descricao`. O `id_usuario` e opcional e local de cada sistema; nao use esse campo para relacionar usuarios entre bancos. Cada grupo precisa ter um usuario MongoDB proprio com acesso minimo necessario e a URI guardada como segredo.
+
+O item `0 - Sair` faz logoff, registra `LOGOFF`, limpa os dados da sessao e retorna para a tela de login. O programa continua aberto para outro usuario entrar. Fechar o console ou uma queda de energia nao garante esse evento.

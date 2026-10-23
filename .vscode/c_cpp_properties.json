@@ -2,16 +2,17 @@
   "configurations": [
     {
       "name": "windows-gcc-x64",
+      "compilerPath": "C:/msys64/ucrt64/bin/gcc.exe",
       "includePath": [
-        "${workspaceFolder}/**"
+        "${workspaceFolder}/PIM_SISTEMA/**",
+        "C:/msys64/ucrt64/include",
+        "C:/msys64/ucrt64/include/postgresql",
+        "C:/Program Files/PostgreSQL/18/include"
       ],
-      "compilerPath": "gcc",
-      "cStandard": "${default}",
-      "cppStandard": "${default}",
-      "intelliSenseMode": "windows-gcc-x64",
-      "compilerArgs": [
-        ""
-      ]
+      "defines": ["__USE_MINGW_ANSI_STDIO=1"],
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-gcc-x64"
     }
   ],
   "version": 4

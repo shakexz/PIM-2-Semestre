@@ -3,8 +3,13 @@
   "tasks": [
     {
       "label": "Compilar e rodar (ERP Torra)",
-      "type": "shell",
-      "command": ".\\compilar_e_rodar.bat",
+      "type": "process",
+      "command": "C:/Windows/System32/cmd.exe",
+      "args": [
+        "/d",
+        "/c",
+        "\"${workspaceFolder}\\compilar_e_rodar (1).bat\""
+      ],
       "options": {
         "cwd": "${workspaceFolder}"
       },

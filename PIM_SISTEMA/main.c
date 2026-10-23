@@ -3,6 +3,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <libpq-fe.h>
+#include <mongoc/mongoc.h>
+#include <time.h>
 
 #define DB_HOST "localhost"
 #define DB_PORT "5432"
@@ -11,6 +13,8 @@
 #define DB_PASSWORD "vr300games"
 
 PGconn *conn = NULL;
+mongoc_client_t *mongo_client = NULL;
+mongoc_collection_t *log_collection = NULL;
 int usuario_logado = 0;
 char login_logado[100];
 
@@ -119,24 +123,132 @@ int tem_permissao(const char *permissao) {
     return ok;
 }
 
-/*
- * guarda tudo que acontece no sistema.
- * O tipo é o evento, como LOGIN_SUCESSO ou BLOQUEIO, e a descrição explica o que aconteceu
- */
-void registrar_log(const char *setor, const char *tipo, const char *descricao) {
-    char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%d", usuario_logado);
+static int tem_alguma_permissao(const char *const permissoes[], size_t total) {
+    for (size_t i = 0; i < total; i++)
+        if (tem_permissao(permissoes[i])) return 1;
+    return 0;
+}
 
-    const char *params[4] = {idbuf, setor, tipo, descricao};
-    const char *sql =
-        "INSERT INTO log_acesso(id_usuario, setor, tipo, descricao) "
-        "VALUES($1::integer, $2, $3, $4)";
+/* Conecta ao banco central de auditoria. A URI fica fora do codigo-fonte. */
+int conectar_mongodb(void) {
+    const char *uri_env = getenv("MONGODB_URI");
+    bson_error_t error;
+    bson_t comando = BSON_INITIALIZER;
+    bson_t resposta = BSON_INITIALIZER;
+    bson_t chaves = BSON_INITIALIZER;
+    bson_t opcoes = BSON_INITIALIZER;
+    bson_t resposta_indice = BSON_INITIALIZER;
+    mongoc_index_model_t *modelo_indice = NULL;
+    mongoc_index_model_t *modelos[1];
+    int ok = 0;
 
-    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "Aviso: falha ao registrar log: %s\n", PQerrorMessage(conn));
+    mongoc_init();
+    if (uri_env == NULL || uri_env[0] == '\0') {
+        fprintf(stderr, "Defina a variavel de ambiente MONGODB_URI antes de iniciar.\n");
+        return 0;
     }
-    PQclear(res);
+
+    mongo_client = mongoc_client_new(uri_env);
+    if (mongo_client == NULL) {
+        fprintf(stderr, "Nao foi possivel criar o cliente MongoDB. Confira MONGODB_URI.\n");
+        goto cleanup;
+    }
+
+    BSON_APPEND_INT32(&comando, "ping", 1);
+    if (!mongoc_client_command_simple(mongo_client, "admin", &comando, NULL,
+                                      &resposta, &error)) {
+        fprintf(stderr, "Falha ao conectar ao MongoDB: %s\n", error.message);
+        goto cleanup;
+    }
+
+    log_collection = mongoc_client_get_collection(mongo_client,
+                                                   "erp_auditoria",
+                                                   "audit_events");
+    if (log_collection == NULL) {
+        fprintf(stderr, "Nao foi possivel abrir erp_auditoria.audit_events.\n");
+        goto cleanup;
+    }
+
+    BSON_APPEND_INT32(&chaves, "id_evento", 1);
+    BSON_APPEND_BOOL(&opcoes, "unique", true);
+    BSON_APPEND_UTF8(&opcoes, "name", "uq_audit_events_id_evento");
+    modelo_indice = mongoc_index_model_new(&chaves, &opcoes);
+    if (modelo_indice == NULL) {
+        fprintf(stderr, "Nao foi possivel preparar o indice de auditoria.\n");
+        goto cleanup;
+    }
+    modelos[0] = modelo_indice;
+    if (!mongoc_collection_create_indexes_with_opts(log_collection, modelos, 1,
+                                                     NULL, &resposta_indice,
+                                                     &error)) {
+        fprintf(stderr, "Falha ao preparar indice id_evento no MongoDB: %s\n",
+                error.message);
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (modelo_indice != NULL) mongoc_index_model_destroy(modelo_indice);
+    bson_destroy(&resposta_indice);
+    bson_destroy(&opcoes);
+    bson_destroy(&chaves);
+    bson_destroy(&resposta);
+    bson_destroy(&comando);
+    return ok;
+}
+
+void desconectar_mongodb(void) {
+    if (log_collection != NULL) {
+        mongoc_collection_destroy(log_collection);
+        log_collection = NULL;
+    }
+    if (mongo_client != NULL) {
+        mongoc_client_destroy(mongo_client);
+        mongo_client = NULL;
+    }
+    mongoc_cleanup();
+}
+
+/* Guarda os eventos novos diretamente na colecao central de auditoria. */
+void registrar_log_com_ator(const char *setor, const char *tipo,
+                            const char *descricao, const char *ator) {
+    bson_t documento = BSON_INITIALIZER;
+    bson_t resposta = BSON_INITIALIZER;
+    bson_oid_t oid;
+    char id_evento[25];
+    bson_error_t error;
+    int inserido;
+
+    if (log_collection == NULL) {
+        fprintf(stderr, "Aviso: MongoDB indisponivel; evento nao registrado.\n");
+        bson_destroy(&resposta);
+        bson_destroy(&documento);
+        return;
+    }
+
+    bson_oid_init(&oid, NULL);
+    bson_oid_to_string(&oid, id_evento);
+    BSON_APPEND_UTF8(&documento, "id_evento", id_evento);
+    BSON_APPEND_UTF8(&documento, "sistema_origem", "ERP_TORRA");
+    BSON_APPEND_DATE_TIME(&documento, "data_hora", (int64_t)time(NULL) * 1000);
+    if (usuario_logado > 0)
+        BSON_APPEND_INT32(&documento, "id_usuario", usuario_logado);
+    if (ator != NULL && ator[0] != '\0')
+        BSON_APPEND_UTF8(&documento, "actor_login", ator);
+    BSON_APPEND_UTF8(&documento, "setor", setor);
+    BSON_APPEND_UTF8(&documento, "tipo", tipo);
+    BSON_APPEND_UTF8(&documento, "descricao", descricao != NULL ? descricao : "");
+
+    inserido = mongoc_collection_insert_one(log_collection, &documento, NULL,
+                                            &resposta, &error);
+    if (!inserido)
+        fprintf(stderr, "Aviso: falha ao registrar log no MongoDB: %s\n", error.message);
+    bson_destroy(&resposta);
+    bson_destroy(&documento);
+}
+
+void registrar_log(const char *setor, const char *tipo, const char *descricao) {
+    registrar_log_com_ator(setor, tipo, descricao, login_logado);
 }
 
 /*
@@ -181,12 +293,7 @@ int login(void) {
         "AND u.senha_hash = crypt($2, u.senha_hash) "
         "AND u.status = 'ATIVO' "
         "AND f.status = 'ATIVO' "
-        "AND NOT EXISTS ("
-        "    SELECT 1 FROM ferias fe "
-        "    WHERE fe.id_funcionario = f.id_funcionario "
-        "      AND fe.status NOT IN ('CANCELADA','ENCERRADA') "
-        "      AND CURRENT_DATE BETWEEN fe.data_inicio AND fe.data_fim"
-        ")";
+        "";
 
     PGresult *res = PQexecParams(conn, sql, 2, NULL, params, NULL, NULL, 0);
 
@@ -205,15 +312,9 @@ int login(void) {
                  "Login negado (credenciais inválidas ou acesso restrito) para o login: %s",
                  usuario);
 
-        const char *params_log[1] = {descricao};
-        const char *logsql =
-            "INSERT INTO log_acesso(setor, tipo, descricao) "
-            "VALUES('SEGURANCA', 'LOGIN_NEGADO', $1)";
+        registrar_log_com_ator("SEGURANCA", "LOGIN_NEGADO", descricao, usuario);
 
-        PGresult *logres = PQexecParams(conn, logsql, 1, NULL, params_log, NULL, NULL, 0);
-        PQclear(logres);
-
-        printf("\nAcesso negado. Verifique usuário, senha, situação do funcionário ou férias.\n");
+        printf("\nAcesso negado. Verifique usuário, senha e situação da conta/funcionário.\n");
         return 0;
     }
 
@@ -539,55 +640,7 @@ void desligar_funcionario(void) {
     PQclear(res);
 }
 
-/*
- * Essa função registra férias para um funcionário. A ideia é salvar a data de início
- * e fim. O status fica em andamento se a data atual estiver dentro do período,
- * senão fica agendada. No login, qualquer férias dentro do período bloqueia
- * o acesso (menos as canceladas).
- */
-void cadastrar_ferias(void) {
-    int idfunc = -1;
-    char idfunc_str[32];
-    char inicio[20], fim[20];
 
-    if (!ler_inteiro("ID do funcionário: ", &idfunc)) {
-        printf("Informe um número válido para o ID do funcionário.\n");
-        return;
-    }
-
-    snprintf(idfunc_str, sizeof(idfunc_str), "%d", idfunc);
-    ler_string("Data início (AAAA-MM-DD): ", inicio, sizeof(inicio));
-    ler_string("Data fim (AAAA-MM-DD): ", fim, sizeof(fim));
-
-    if (inicio[0] == '\0' || fim[0] == '\0') {
-        printf("Informe as duas datas.\n");
-        return;
-    }
-
-    const char *params[3] = {idfunc_str, inicio, fim};
-    const char *sql =
-        "INSERT INTO ferias(id_funcionario,data_inicio,data_fim,status) "
-        "VALUES($1::integer,$2::date,$3::date,"
-        "CASE WHEN CURRENT_DATE BETWEEN $2::date AND $3::date "
-        "THEN 'EM_ANDAMENTO' ELSE 'AGENDADA' END)";
-
-    PGresult *res = PQexecParams(conn, sql, 3, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
-        printf("Período de férias cadastrado.\n");
-        char descricao[150];
-        snprintf(descricao, sizeof(descricao), "Férias cadastradas para o funcionário ID %d (%s a %s)",
-                 idfunc, inicio, fim);
-        registrar_log("RH", "FERIAS", descricao);
-    } else {
-        printf("Erro (confira o ID do funcionário e as datas): %s\n", PQerrorMessage(conn));
-    }
-    PQclear(res);
-}
-
-/*
- * Aqui eu vejo todas as permissões que existem e a qual perfil cada uma pertence.
- * Isso ajuda a explicar a regra de acesso do sistema.
- */
 void listar_permissoes(void) {
     const char *sql =
         "SELECT p.nome, pe.nome "
@@ -651,50 +704,322 @@ void minhas_permissoes(void) {
  * Essa função mostra os logs do sistema em ordem de data mais recente.
  * A ideia é manter um histórico do que aconteceu para auditoria.
  */
+static int data_local_para_epoch(const char *texto, int dia_seguinte, int64_t *ms) {
+    int ano, mes, dia;
+    struct tm data = {0};
+    struct tm conferida;
+    time_t instante;
+    char extra;
+    if (strlen(texto) != 10 || sscanf(texto, "%2d/%2d/%4d%c", &dia, &mes, &ano, &extra) != 3 || ano < 1900 || mes < 1 || mes > 12 || dia < 1 || dia > 31) return 0;
+    data.tm_year = ano - 1900; data.tm_mon = mes - 1; data.tm_mday = dia; data.tm_isdst = -1;
+    instante = mktime(&data);
+    if (instante == (time_t)-1) return 0;
+    if (data.tm_year != ano - 1900 || data.tm_mon != mes - 1 || data.tm_mday != dia) return 0;
+    if (dia_seguinte) {
+        data.tm_mday++;
+        data.tm_isdst = -1;
+        instante = mktime(&data);
+        if (instante == (time_t)-1) return 0;
+    }
+#ifdef _WIN32
+    if (localtime_s(&conferida, &instante) != 0) return 0;
+#else
+    if (localtime_r(&instante, &conferida) == NULL) return 0;
+#endif
+    *ms = (int64_t)instante * 1000;
+    return 1;
+}
+
+static const char *campo_texto(const bson_t *documento, const char *campo) {
+    bson_iter_t iter;
+    if (bson_iter_init_find(&iter, documento, campo) && BSON_ITER_HOLDS_UTF8(&iter)) return bson_iter_utf8(&iter, NULL);
+    return "";
+}
+
 void listar_logs(void) {
     char inicio[16], fim[16], usuario[100], setor[51];
-    ler_string("Data inicial (AAAA-MM-DD): ", inicio, sizeof(inicio));
-    ler_string("Data final (AAAA-MM-DD): ", fim, sizeof(fim));
+    int64_t inicio_ms, fim_ms;
+    bson_t filtro = BSON_INITIALIZER, faixa = BSON_INITIALIZER;
+    bson_t opcoes = BSON_INITIALIZER, ordem = BSON_INITIALIZER;
+    bson_error_t error;
+    mongoc_cursor_t *cursor;
+    const bson_t *documento;
+    int total = 0;
+    ler_string("Data inicial (DD/MM/AAAA): ", inicio, sizeof(inicio));
+    ler_string("Data final (DD/MM/AAAA): ", fim, sizeof(fim));
     ler_string("Login (Enter para todos): ", usuario, sizeof(usuario));
     ler_string("Setor (Enter para todos, ex.: RH, FINANCEIRO): ", setor, sizeof(setor));
-
-    if (strlen(inicio) != 10 || strlen(fim) != 10) {
-        printf("Informe as datas no formato AAAA-MM-DD.\n");
+    if (!data_local_para_epoch(inicio, 0, &inicio_ms) || !data_local_para_epoch(fim, 1, &fim_ms) || fim_ms <= inicio_ms) {
+        printf("Informe datas validas no formato DD/MM/AAAA e em ordem.\n");
         return;
     }
-    const char *params[4] = {inicio, fim, usuario, setor};
-    const char *sql =
-        "SELECT to_char(l.data_hora, 'YYYY-MM-DD HH24:MI:SS'), COALESCE(u.login,'-'), l.setor, l.tipo, COALESCE(l.descricao,'') "
-        "FROM log_acesso l LEFT JOIN usuario u ON u.id_usuario=l.id_usuario "
-        "WHERE l.data_hora >= $1::date AND l.data_hora < ($2::date + INTERVAL '1 day') "
-        "AND ($3 = '' OR u.login = $3) AND ($4 = '' OR l.setor = upper($4)) "
-        "ORDER BY l.data_hora DESC, l.id_log DESC LIMIT 500";
-
-    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "%s\n", PQerrorMessage(conn));
-        PQclear(res);
-        return;
-    }
-
+    BSON_APPEND_DATE_TIME(&faixa, "$gte", inicio_ms);
+    BSON_APPEND_DATE_TIME(&faixa, "$lt", fim_ms);
+    BSON_APPEND_DOCUMENT(&filtro, "data_hora", &faixa);
+    if (usuario[0] != '\0') BSON_APPEND_UTF8(&filtro, "actor_login", usuario);
+    if (setor[0] != '\0') { maiusculas(setor); BSON_APPEND_UTF8(&filtro, "setor", setor); }
+    BSON_APPEND_INT32(&ordem, "data_hora", -1);
+    BSON_APPEND_DOCUMENT(&opcoes, "sort", &ordem);
+    BSON_APPEND_INT64(&opcoes, "limit", 500);
+    cursor = mongoc_collection_find_with_opts(log_collection, &filtro, &opcoes, NULL);
     printf("\nDATA/HORA            LOGIN              SETOR           TIPO              DESCRICAO\n");
     printf("------------------------------------------------------------------------------------------\n");
-    for (int i = 0; i < PQntuples(res); i++) {
-        printf("%-20s %-18s %-15s %-17s %s\n",
-               PQgetvalue(res, i, 0), PQgetvalue(res, i, 1),
-               PQgetvalue(res, i, 2), PQgetvalue(res, i, 3), PQgetvalue(res, i, 4));
+    while (mongoc_cursor_next(cursor, &documento)) {
+        bson_iter_t iter;
+        char data_formatada[24] = "-";
+        if (bson_iter_init_find(&iter, documento, "data_hora") && BSON_ITER_HOLDS_DATE_TIME(&iter)) {
+            int64_t epoch_ms = bson_iter_date_time(&iter);
+            time_t segundos = (time_t)(epoch_ms / 1000);
+            struct tm utc;
+#ifdef _WIN32
+            if (gmtime_s(&utc, &segundos) == 0)
+#else
+            if (gmtime_r(&segundos, &utc) != NULL)
+#endif
+                strftime(data_formatada, sizeof(data_formatada), "%Y-%m-%d %H:%M:%S", &utc);
+        }
+        const char *ator = campo_texto(documento, "actor_login");
+        printf("%-20s %-18s %-15s %-17s %s\n", data_formatada, ator[0] ? ator : "-",
+               campo_texto(documento, "setor"), campo_texto(documento, "tipo"), campo_texto(documento, "descricao"));
+        total++;
     }
-    if (PQntuples(res) == 0) printf("Nenhum log encontrado no período informado.\n");
+    if (mongoc_cursor_error(cursor, &error)) fprintf(stderr, "Falha ao consultar logs no MongoDB: %s\n", error.message);
+    else if (total == 0) printf("Nenhum log encontrado no periodo informado.\n");
+    mongoc_cursor_destroy(cursor);
+    bson_destroy(&ordem); bson_destroy(&opcoes); bson_destroy(&faixa); bson_destroy(&filtro);
+}
 
+static int executar_atualizacao(const char *sql, int n, const char *const *params) {
+    PGresult *res = PQexecParams(conn, sql, n, NULL, params, NULL, NULL, 0);
+    int ok = PQresultStatus(res) == PGRES_TUPLES_OK || PQresultStatus(res) == PGRES_COMMAND_OK;
+    if (!ok) printf("Falha na operacao: %s\n", PQerrorMessage(conn));
+    PQclear(res);
+    return ok;
+}
+
+static void listar_produtos(void) {
+    PGresult *res = PQexec(conn,
+        "SELECT id_produto,codigo,nome,quantidade,estoque_minimo "
+        "FROM estoque_produto WHERE ativo ORDER BY nome");
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        printf("Falha ao consultar produtos: %s\n", PQerrorMessage(conn));
+    } else {
+        printf("\nID  CODIGO              PRODUTO                                  SALDO       MINIMO\n");
+        for (int i = 0; i < PQntuples(res); i++)
+            printf("%-3s %-20s %-40s %-11s %s\n", PQgetvalue(res,i,0), PQgetvalue(res,i,1),
+                   PQgetvalue(res,i,2), PQgetvalue(res,i,3), PQgetvalue(res,i,4));
+        if (PQntuples(res) == 0) printf("Nenhum produto cadastrado.\n");
+    }
     PQclear(res);
 }
 
-/*
- * Menu do usuário comum. Ele só pode verificar permissões e acessar módulos
- * que o perfil dele permitiu. A regra aqui é simples: se tiver permissão, entra.
- * As opções de férias e logs só funcionam para quem tem a permissão
- * (por exemplo RH e GERENCIA).
- */
+static void atualizar_alerta_estoque(const char *id_produto) {
+    const char *params[1] = {id_produto};
+    executar_atualizacao(
+        "INSERT INTO compras_alerta_reposicao(id_produto,quantidade_atual,estoque_minimo) "
+        "SELECT id_produto,quantidade,estoque_minimo FROM estoque_produto "
+        "WHERE id_produto=$1::bigint AND ativo AND quantidade <= estoque_minimo "
+        "ON CONFLICT (id_produto) WHERE status='ABERTO' "
+        "DO UPDATE SET quantidade_atual=EXCLUDED.quantidade_atual,estoque_minimo=EXCLUDED.estoque_minimo",
+        1, params);
+}
+
+static void modulo_estoque(void) {
+    const char *const permissoes[] = {"ESTOQUE_VISUALIZAR", "ESTOQUE_PRODUTOS_GERENCIAR", "ESTOQUE_MINIMO_GERENCIAR"};
+    if (!tem_alguma_permissao(permissoes, sizeof(permissoes) / sizeof(permissoes[0]))) {
+        puts("Acesso negado ao modulo de Estoque.");
+        return;
+    }
+    int op = -1;
+    do {
+        printf("\n========== ESTOQUE ==========\n");
+        if (tem_permissao("ESTOQUE_PRODUTOS_GERENCIAR")) printf("1 - Cadastrar produto\n3 - Registrar entrada de estoque\n");
+        if (tem_permissao("ESTOQUE_VISUALIZAR")) printf("2 - Listar produtos e saldos\n");
+        if (tem_permissao("ESTOQUE_MINIMO_GERENCIAR")) printf("4 - Definir estoque minimo\n");
+        printf("0 - Voltar\n");
+        if (!ler_inteiro("Escolha: ", &op)) { op = -1; continue; }
+        if (op == 1) {
+            char codigo[41], nome[121];
+            if (!tem_permissao("ESTOQUE_PRODUTOS_GERENCIAR")) { puts("Acesso negado."); continue; }
+            ler_string("Codigo do produto: ", codigo, sizeof(codigo));
+            ler_string("Nome: ", nome, sizeof(nome));
+            if (!codigo[0] || !nome[0]) { puts("Codigo e nome sao obrigatorios."); continue; }
+            const char *p[2] = {codigo,nome};
+            if (executar_atualizacao("INSERT INTO estoque_produto(codigo,nome) VALUES($1,$2)",2,p)) {
+                registrar_log("ESTOQUE","PRODUTO_CADASTRADO",codigo); puts("Produto cadastrado.");
+            }
+        } else if (op == 2) {
+            if (!tem_permissao("ESTOQUE_VISUALIZAR")) puts("Acesso negado."); else listar_produtos();
+        } else if (op == 3 || op == 4) {
+            int id; char idtxt[24], quantidade[32];
+            const char *perm = op == 3 ? "ESTOQUE_PRODUTOS_GERENCIAR" : "ESTOQUE_MINIMO_GERENCIAR";
+            if (!tem_permissao(perm)) { puts("Acesso negado."); continue; }
+            if (!ler_inteiro("ID do produto: ",&id) || id <= 0) { puts("ID invalido."); continue; }
+            snprintf(idtxt,sizeof(idtxt),"%d",id);
+            ler_string(op == 3 ? "Quantidade recebida: " : "Novo estoque minimo: ",quantidade,sizeof(quantidade));
+            char *fim=NULL; double q=strtod(quantidade,&fim);
+            if (fim==quantidade || *fim || q < 0 || (op == 3 && q == 0)) { puts("Quantidade invalida."); continue; }
+            const char *p[2] = {quantidade,idtxt};
+            const char *sql = op == 3
+                ? "UPDATE estoque_produto SET quantidade=quantidade+$1::numeric WHERE id_produto=$2::bigint AND ativo"
+                : "UPDATE estoque_produto SET estoque_minimo=$1::numeric WHERE id_produto=$2::bigint AND ativo";
+            if (executar_atualizacao(sql,2,p)) {
+                atualizar_alerta_estoque(idtxt);
+                registrar_log("ESTOQUE",op == 3 ? "ENTRADA_ESTOQUE" : "ESTOQUE_MINIMO_ALTERADO",idtxt);
+                puts("Estoque atualizado.");
+            }
+        } else if (op != 0) puts("Opcao invalida.");
+    } while (op != 0);
+}
+
+static void modulo_vendas(void) {
+    const char *const permissoes[] = {"VENDAS_VISUALIZAR", "VENDAS_CADASTRAR"};
+    if (!tem_alguma_permissao(permissoes, sizeof(permissoes) / sizeof(permissoes[0]))) {
+        puts("Acesso negado ao modulo de Vendas.");
+        return;
+    }
+    int op=-1;
+    do {
+        printf("\n========== VENDAS ==========\n");
+        if (tem_permissao("VENDAS_CADASTRAR")) printf("1 - Nova venda\n");
+        if (tem_permissao("VENDAS_VISUALIZAR")) printf("2 - Consultar vendas\n");
+        printf("0 - Voltar\n");
+        if (!ler_inteiro("Escolha: ",&op)) { op=-1; continue; }
+        if (op == 1) {
+            int id; char idtxt[24], quantidade[32], valor[32];
+            if (!tem_permissao("VENDAS_CADASTRAR")) { puts("Acesso negado."); continue; }
+            if (!ler_inteiro("ID do produto: ",&id) || id<=0) { puts("ID invalido."); continue; }
+            snprintf(idtxt,sizeof(idtxt),"%d",id);
+            ler_string("Quantidade: ",quantidade,sizeof(quantidade));
+            ler_string("Valor unitario: ",valor,sizeof(valor));
+            char *fim=NULL; double q=strtod(quantidade,&fim);
+            if (fim==quantidade || *fim || q<=0) { puts("Quantidade invalida."); continue; }
+            double v=strtod(valor,&fim);
+            if (fim==valor || *fim || v<0) { puts("Valor invalido."); continue; }
+            const char *p[4]={quantidade,idtxt,valor,login_logado};
+            PGresult *res=PQexecParams(conn,
+                "WITH baixa AS (UPDATE estoque_produto SET quantidade=quantidade-$1::numeric "
+                "WHERE id_produto=$2::bigint AND ativo AND quantidade >= $1::numeric RETURNING id_produto,quantidade,estoque_minimo) "
+                "INSERT INTO vendas_venda(id_produto,quantidade,valor_unitario,vendedor) "
+                "SELECT id_produto,$1::numeric,$3::numeric,$4 FROM baixa RETURNING id_produto",4,NULL,p,NULL,NULL,0);
+            if (PQresultStatus(res)==PGRES_TUPLES_OK && PQntuples(res)>0) {
+                atualizar_alerta_estoque(idtxt);
+                registrar_log("VENDAS","VENDA_CADASTRADA",idtxt); puts("Venda registrada e estoque atualizado.");
+            } else if (PQresultStatus(res)==PGRES_TUPLES_OK) puts("Produto inexistente ou saldo insuficiente.");
+            else printf("Falha ao registrar venda: %s\n",PQerrorMessage(conn));
+            PQclear(res);
+        } else if (op == 2) {
+            if (!tem_permissao("VENDAS_VISUALIZAR")) { puts("Acesso negado."); continue; }
+            PGresult *res=PQexec(conn,"SELECT v.id_venda,v.data_hora,p.nome,v.quantidade,v.valor_unitario,v.vendedor FROM vendas_venda v JOIN estoque_produto p USING(id_produto) ORDER BY v.data_hora DESC LIMIT 100");
+            if (PQresultStatus(res)==PGRES_TUPLES_OK) for(int i=0;i<PQntuples(res);i++)
+                printf("Venda %s | %s | %s | qtd %s | R$ %s | %s\n",PQgetvalue(res,i,0),PQgetvalue(res,i,1),PQgetvalue(res,i,2),PQgetvalue(res,i,3),PQgetvalue(res,i,4),PQgetvalue(res,i,5));
+            else printf("Falha ao consultar vendas: %s\n",PQerrorMessage(conn));
+            PQclear(res);
+        } else if(op!=0) puts("Opcao invalida.");
+    } while(op!=0);
+}
+
+static void modulo_compras(void) {
+    const char *const permissoes[] = {"COMPRAS_ALERTAS_VISUALIZAR", "COMPRAS_VISUALIZAR", "COMPRAS_EDITAR"};
+    if (!tem_alguma_permissao(permissoes, sizeof(permissoes) / sizeof(permissoes[0]))) {
+        puts("Acesso negado ao modulo de Compras.");
+        return;
+    }
+    int op=-1;
+    do {
+        printf("\n========== COMPRAS ==========\n");
+        if (tem_permissao("COMPRAS_ALERTAS_VISUALIZAR") || tem_permissao("COMPRAS_VISUALIZAR")) printf("1 - Consultar alertas de reposicao\n");
+        if (tem_permissao("COMPRAS_EDITAR")) printf("2 - Registrar recebimento de compra\n");
+        printf("0 - Voltar\n");
+        if (!ler_inteiro("Escolha: ",&op)) { op=-1; continue; }
+        if(op==1) {
+            if(!tem_permissao("COMPRAS_ALERTAS_VISUALIZAR") && !tem_permissao("COMPRAS_VISUALIZAR")) { puts("Acesso negado."); continue; }
+            PGresult *res=PQexec(conn,"SELECT a.id_alerta,p.id_produto,p.nome,a.quantidade_atual,a.estoque_minimo,a.criado_em FROM compras_alerta_reposicao a JOIN estoque_produto p USING(id_produto) WHERE a.status='ABERTO' ORDER BY a.criado_em");
+            if(PQresultStatus(res)==PGRES_TUPLES_OK) for(int i=0;i<PQntuples(res);i++)
+                printf("Alerta %s | produto %s (%s) | saldo %s | minimo %s | %s\n",PQgetvalue(res,i,0),PQgetvalue(res,i,2),PQgetvalue(res,i,1),PQgetvalue(res,i,3),PQgetvalue(res,i,4),PQgetvalue(res,i,5));
+            else printf("Falha ao consultar alertas: %s\n",PQerrorMessage(conn));
+            if(PQntuples(res)==0) puts("Nao ha alertas abertos."); PQclear(res);
+        } else if(op==2) {
+            int id; char idtxt[24],quantidade[32],custo[32];
+            if(!tem_permissao("COMPRAS_EDITAR")) { puts("Acesso negado."); continue; }
+            if(!ler_inteiro("ID do produto: ",&id)||id<=0) { puts("ID invalido."); continue; }
+            snprintf(idtxt,sizeof(idtxt),"%d",id);
+            ler_string("Quantidade recebida: ",quantidade,sizeof(quantidade));
+            ler_string("Custo unitario: ",custo,sizeof(custo));
+            char *fim=NULL; double q=strtod(quantidade,&fim);
+            if(fim==quantidade||*fim||q<=0) { puts("Quantidade invalida."); continue; }
+            double c=strtod(custo,&fim); if(fim==custo||*fim||c<0) { puts("Custo invalido."); continue; }
+            if(!executar_atualizacao("BEGIN",0,NULL)) continue;
+            const char *p[4]={quantidade,idtxt,custo,login_logado};
+            int ok=executar_atualizacao("INSERT INTO compras_pedido(id_produto,quantidade,custo_unitario,comprador) VALUES($2::bigint,$1::numeric,$3::numeric,$4)",4,p);
+            const char *p2[2]={quantidade,idtxt};
+            ok=ok && executar_atualizacao("UPDATE estoque_produto SET quantidade=quantidade+$1::numeric WHERE id_produto=$2::bigint AND ativo",2,p2);
+            const char *p3[1]={idtxt};
+            ok=ok && executar_atualizacao("UPDATE compras_alerta_reposicao SET status='ATENDIDO',atendido_em=CURRENT_TIMESTAMP WHERE id_produto=$1::bigint AND status='ABERTO'",1,p3);
+            if(ok) { executar_atualizacao("COMMIT",0,NULL); registrar_log("COMPRAS","COMPRA_RECEBIDA",idtxt); puts("Compra registrada; saldo atualizado e alerta atendido."); }
+            else executar_atualizacao("ROLLBACK",0,NULL);
+        } else if(op!=0) puts("Opcao invalida.");
+    } while(op!=0);
+}
+
+static void relatorio_vendas(void) {
+    PGresult *res=PQexec(conn,"SELECT count(*),COALESCE(sum(quantidade*valor_unitario),0) FROM vendas_venda WHERE data_hora >= date_trunc('month',CURRENT_DATE)");
+    if(PQresultStatus(res)==PGRES_TUPLES_OK && PQntuples(res)) printf("Vendas no mes: %s | faturamento: R$ %s\n",PQgetvalue(res,0,0),PQgetvalue(res,0,1));
+    else printf("Falha no relatorio: %s\n",PQerrorMessage(conn)); PQclear(res);
+}
+
+static void relatorio_estoque(void) {
+    PGresult *res=PQexec(conn,"SELECT codigo,nome,quantidade,estoque_minimo FROM estoque_produto WHERE ativo ORDER BY (quantidade<=estoque_minimo) DESC,nome");
+    if(PQresultStatus(res)==PGRES_TUPLES_OK) for(int i=0;i<PQntuples(res);i++)
+        printf("%s | %s | saldo %s | minimo %s%s\n",PQgetvalue(res,i,0),PQgetvalue(res,i,1),PQgetvalue(res,i,2),PQgetvalue(res,i,3),atof(PQgetvalue(res,i,2))<=atof(PQgetvalue(res,i,3))?" | REPOSICAO NECESSARIA":"");
+    else printf("Falha no relatorio: %s\n",PQerrorMessage(conn)); PQclear(res);
+}
+
+static void relatorio_compras(void) {
+    PGresult *res=PQexec(conn,"SELECT count(*),COALESCE(sum(quantidade*custo_unitario),0) FROM compras_pedido WHERE data_hora >= date_trunc('month',CURRENT_DATE)");
+    if(PQresultStatus(res)==PGRES_TUPLES_OK && PQntuples(res)) printf("Compras recebidas no mes: %s | custo total: R$ %s\n",PQgetvalue(res,0,0),PQgetvalue(res,0,1));
+    else printf("Falha no relatorio: %s\n",PQerrorMessage(conn));
+    PQclear(res);
+}
+
+static void modulo_relatorios(void) {
+    const char *const permissoes[] = {"RELATORIOS_VISUALIZAR", "LOGS_VISUALIZAR"};
+    if (!tem_alguma_permissao(permissoes, sizeof(permissoes) / sizeof(permissoes[0]))) {
+        puts("Acesso negado aos relatorios e logs.");
+        return;
+    }
+    int op=-1;
+    do {
+        printf("\n========== GESTAO / RELATORIOS ==========\n");
+        if (tem_permissao("RELATORIOS_VISUALIZAR")) printf("1 - Relatorio de vendas e faturamento mensal\n2 - Relatorio de estoque e itens no minimo\n3 - Relatorio de compras\n");
+        if (tem_permissao("LOGS_VISUALIZAR")) printf("4 - Consultar logs de auditoria\n");
+        printf("0 - Voltar\n");
+        if(!ler_inteiro("Escolha: ",&op)) { op=-1; continue; }
+        if(op==1) { if(tem_permissao("RELATORIOS_VISUALIZAR")) relatorio_vendas(); else puts("Acesso negado."); }
+        else if(op==2) { if(tem_permissao("RELATORIOS_VISUALIZAR")) relatorio_estoque(); else puts("Acesso negado."); }
+        else if(op==3) { if(tem_permissao("RELATORIOS_VISUALIZAR")) relatorio_compras(); else puts("Acesso negado."); }
+        else if(op==4) { if(tem_permissao("LOGS_VISUALIZAR")) listar_logs(); else puts("Acesso negado."); }
+        else if(op!=0) puts("Opcao invalida.");
+    } while(op!=0);
+}
+
+static void modulo_financeiro(void) {
+    if(!tem_permissao("FINANCEIRO_VISUALIZAR")) { puts("Acesso negado ao Financeiro."); return; }
+    puts("\n========== FINANCEIRO ==========");
+    relatorio_vendas();
+    PGresult *res=PQexec(conn,"SELECT count(*),COALESCE(sum(quantidade*custo_unitario),0) FROM compras_pedido WHERE data_hora >= date_trunc('month',CURRENT_DATE)");
+    if(PQresultStatus(res)==PGRES_TUPLES_OK && PQntuples(res)) printf("Compras no mes: %s | custos: R$ %s\n",PQgetvalue(res,0,0),PQgetvalue(res,0,1));
+    else printf("Falha ao consultar compras: %s\n",PQerrorMessage(conn)); PQclear(res);
+}
+
+static void modulo_rh(void) {
+    if(!tem_permissao("RH_VISUALIZAR")) { puts("Acesso negado ao RH."); return; }
+    PGresult *res=PQexec(conn,"SELECT f.nome,f.setor,u.login,f.status,f.data_admissao FROM funcionario f LEFT JOIN usuario u USING(id_funcionario) ORDER BY f.nome");
+    if(PQresultStatus(res)==PGRES_TUPLES_OK) for(int i=0;i<PQntuples(res);i++)
+        printf("%s | %s | login: %s | %s | admissao: %s\n",PQgetvalue(res,i,0),PQgetvalue(res,i,1),PQgetvalue(res,i,2),PQgetvalue(res,i,3),PQgetvalue(res,i,4));
+    else printf("Falha ao consultar funcionarios: %s\n",PQerrorMessage(conn)); PQclear(res);
+}
+
 void menu_usuario(void) {
     int op = -1;
     do {
@@ -704,12 +1029,12 @@ void menu_usuario(void) {
         printf("========================================\n");
         printf("Usuario: %s\n\n", login_logado);
         printf("1 - Consultar minhas permissoes\n");
-        printf("2 - Acessar modulo de vendas\n");
-        printf("3 - Acessar modulo de estoque\n");
-        printf("4 - Acessar modulo de compras\n");
-        printf("5 - Acessar financeiro\n");
-        printf("6 - Cadastrar ferias\n");
-        printf("7 - Consultar logs\n");
+        if (tem_permissao("VENDAS_VISUALIZAR") || tem_permissao("VENDAS_CADASTRAR")) printf("2 - Vendas\n");
+        if (tem_permissao("ESTOQUE_VISUALIZAR") || tem_permissao("ESTOQUE_PRODUTOS_GERENCIAR") || tem_permissao("ESTOQUE_MINIMO_GERENCIAR")) printf("3 - Estoque\n");
+        if (tem_permissao("COMPRAS_ALERTAS_VISUALIZAR") || tem_permissao("COMPRAS_VISUALIZAR") || tem_permissao("COMPRAS_EDITAR")) printf("4 - Compras\n");
+        if (tem_permissao("FINANCEIRO_VISUALIZAR")) printf("5 - Financeiro\n");
+        if (tem_permissao("RELATORIOS_VISUALIZAR") || tem_permissao("LOGS_VISUALIZAR")) printf("6 - Gestao / relatorios / logs\n");
+        if (tem_permissao("RH_VISUALIZAR")) printf("7 - Recursos Humanos\n");
         printf("8 - Alterar minha senha\n");
         printf("0 - Sair\n");
 
@@ -726,43 +1051,27 @@ void menu_usuario(void) {
                 pausa();
                 break;
             case 2:
-                printf(tem_permissao("VENDAS_VISUALIZAR")
-                           ? "\nAcesso liberado ao modulo de Vendas.\n"
-                           : "\nAcesso negado ao modulo de Vendas.\n");
+                modulo_vendas();
                 pausa();
                 break;
             case 3:
-                printf(tem_permissao("ESTOQUE_VISUALIZAR")
-                           ? "\nAcesso liberado ao modulo de Estoque.\n"
-                           : "\nAcesso negado ao modulo de Estoque.\n");
+                modulo_estoque();
                 pausa();
                 break;
             case 4:
-                printf(tem_permissao("COMPRAS_VISUALIZAR")
-                           ? "\nAcesso liberado ao modulo de Compras.\n"
-                           : "\nAcesso negado ao modulo de Compras.\n");
+                modulo_compras();
                 pausa();
                 break;
             case 5:
-                printf(tem_permissao("FINANCEIRO_VISUALIZAR")
-                           ? "\nAcesso liberado ao Financeiro.\n"
-                           : "\nAcesso negado ao Financeiro.\n");
+                modulo_financeiro();
                 pausa();
                 break;
             case 6:
-                if (!tem_permissao("FERIAS_GERENCIAR")) {
-                    printf("Acesso negado para cadastrar férias.\n");
-                } else {
-                    cadastrar_ferias();
-                }
+                modulo_relatorios();
                 pausa();
                 break;
             case 7:
-                if (!tem_permissao("LOGS_VISUALIZAR")) {
-                    printf("Acesso negado aos logs.\n");
-                } else {
-                    listar_logs();
-                }
+                modulo_rh();
                 pausa();
                 break;
             case 8:
@@ -780,7 +1089,7 @@ void menu_usuario(void) {
 }
 
 /*
- * Menu administrativo. Aqui o admin controla usuários, perfis, férias e logs.
+ * Menu administrativo. Aqui o admin controla usuarios, permissoes, auditoria e acessa os modulos.
  * É o módulo que gerencia a segurança do sistema.
  */
 void menu_admin(void) {
@@ -797,11 +1106,11 @@ void menu_admin(void) {
         printf("4 - Revogar acesso\n");
         printf("5 - Reativar usuario\n");
         printf("6 - Desligar funcionario\n");
-        printf("7 - Cadastrar ferias\n");
-        printf("8 - Consultar permissoes de todos os perfis\n");
-        printf("9 - Consultar logs\n");
-        printf("10 - Alterar minha senha\n");
-        printf("11 - Recuperar senha de usuário\n");
+        printf("7 - Consultar permissoes de todos os perfis\n");
+        printf("8 - Consultar logs\n");
+        printf("9 - Alterar minha senha\n");
+        printf("10 - Recuperar senha de usuario\n");
+        printf("11 - Modulo de Vendas\n12 - Modulo de Estoque\n13 - Modulo de Compras\n14 - Financeiro\n15 - Recursos Humanos\n16 - Relatorios de Gestao\n");
         printf("0 - Sair\n");
 
         if (!ler_inteiro("Escolha: ", &op)) {
@@ -853,7 +1162,7 @@ void menu_admin(void) {
                 pausa();
                 break;
             case 6:
-                if (!tem_permissao("USUARIOS_GERENCIAR")) {
+                if (!tem_permissao("FUNCIONARIOS_DESLIGAR")) {
                     printf("Acesso negado para desligar funcionário.\n");
                 } else {
                     desligar_funcionario();
@@ -861,14 +1170,6 @@ void menu_admin(void) {
                 pausa();
                 break;
             case 7:
-                if (!tem_permissao("FERIAS_GERENCIAR")) {
-                    printf("Acesso negado para cadastrar férias.\n");
-                } else {
-                    cadastrar_ferias();
-                }
-                pausa();
-                break;
-            case 8:
                 if (!tem_permissao("PERMISSOES_GERENCIAR")) {
                     printf("Acesso negado para consultar permissões.\n");
                 } else {
@@ -876,7 +1177,7 @@ void menu_admin(void) {
                 }
                 pausa();
                 break;
-            case 9:
+            case 8:
                 if (!tem_permissao("LOGS_VISUALIZAR")) {
                     printf("Acesso negado aos logs.\n");
                 } else {
@@ -884,11 +1185,11 @@ void menu_admin(void) {
                 }
                 pausa();
                 break;
-            case 10:
+            case 9:
                 alterar_senha();
                 pausa();
                 break;
-            case 11:
+            case 10:
                 if (!tem_permissao("USUARIOS_GERENCIAR")) {
                     printf("Acesso negado para recuperar senha.\n");
                 } else {
@@ -896,6 +1197,12 @@ void menu_admin(void) {
                 }
                 pausa();
                 break;
+            case 11: modulo_vendas(); pausa(); break;
+            case 12: modulo_estoque(); pausa(); break;
+            case 13: modulo_compras(); pausa(); break;
+            case 14: modulo_financeiro(); pausa(); break;
+            case 15: modulo_rh(); pausa(); break;
+            case 16: modulo_relatorios(); pausa(); break;
             case 0:
                 break;
             default:
@@ -920,22 +1227,34 @@ int main(void) {
     if (!conectar())
         return 1;
 
-    limpar_tela();
-    printf("========================================\n");
-    printf("              ERP TORRA\n");
-    printf("       SEGURANCA / PERMISSOES\n");
-    printf("========================================\n\n");
-
-    if (!login()) {
+    if (!conectar_mongodb()) {
         PQfinish(conn);
-        return 0;
+        desconectar_mongodb();
+        return 1;
     }
 
-    if (tem_permissao("USUARIOS_GERENCIAR"))
-        menu_admin();
-    else
-        menu_usuario();
+    for (;;) {
+        usuario_logado = 0;
+        login_logado[0] = '\0';
 
-    PQfinish(conn);
-    return 0;
+        limpar_tela();
+        printf("========================================\n");
+        printf("              ERP TORRA\n");
+        printf("       SEGURANCA / PERMISSOES\n");
+        printf("========================================\n\n");
+
+        if (!login())
+            continue;
+
+        if (tem_permissao("USUARIOS_GERENCIAR"))
+            menu_admin();
+        else
+            menu_usuario();
+
+        registrar_log("SEGURANCA", "LOGOFF", "Usuario encerrou a sessao");
+        usuario_logado = 0;
+        login_logado[0] = '\0';
+        printf("\nSessao encerrada. Faca login para continuar usando o sistema.\n");
+        pausa();
+    }
 }
